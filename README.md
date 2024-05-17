@@ -1,4 +1,4 @@
-![Layer-8-Logo-Wide](https://user-images.githubusercontent.com/8293038/96061566-93d8af00-0e61-11eb-8b84-3fd207290be2.png)
+Credits to Layer 8 Security for the original Python Script
 
 # SilentHound
 Quietly enumerate an Active Directory Domain via LDAP parsing users, admins, groups, etc. Created by [Nick Swink](https://github.com/nickswink) from [Layer 8 Security](https://layer8security.com).
