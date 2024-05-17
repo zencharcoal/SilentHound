@@ -1,375 +1,299 @@
-#!/usr/bin/python3
+param (
+    [string]$Target,
+    [string]$Domain,
+    [string]$Username = "",
+    [string]$Password = "",
+    [string]$Hashes = "",
+    [string]$Output = "",
+    [switch]$Groups,
+    [switch]$OrgUnit,
+    [switch]$Keywords,
+    [switch]$Kerberoast,
+    [switch]$SSL,
+    [int]$DnsTimeout = 90
+)
 
-import time, sys, socket, argparse, pickle, json
-from colorama import Fore, Style
-from os.path import exists
-from ldap3 import Server, Connection, SAFE_SYNC, SUBTREE, ALL_ATTRIBUTES
-from ldap3.core.exceptions import LDAPInvalidCredentialsResult, LDAPInvalidDNSyntaxResult, LDAPSocketOpenError
-from alive_progress import alive_bar
-
-# Constants
-NTLM = "NTLM"
-SIMPLE = "SIMPLE"
-ANONYMOUS = "ANONYMOUS"
-
-# Global Functions
-def banner():
-    dashline = "-" * 75
-    print(Fore.RED + r"""
+function Show-Banner {
+    $banner = @"
    _____ _ _            _   _    _                       _ 
   / ____(_) |          | | | |  | |                     | |
  | (___  _| | ___ _ __ | |_| |__| | ___  _   _ _ __   __| |
   \___ \| | |/ _ \ '_ \| __|  __  |/ _ \| | | | '_ \ / _` |
   ____) | | |  __/ | | | |_| |  | | (_) | |_| | | | | (_| |
  |_____/|_|_|\___|_| |_|\__|_|  |_|\___/ \__,_|_| |_|\__,_|
+Original Python Credit to:
+author: Nick Swink aka c0rnbread
+company: Layer 8 Security <layer8security.com>
+"@
+    Write-Host $banner -ForegroundColor Red
+}
 
-    """ + Fore.WHITE + """author: Nick Swink aka c0rnbread
+function Get-UserPrincipalName {
+    param (
+        [string]$CN,
+        [array]$CN_UPN_DictList
+    )
+    foreach ($user in $CN_UPN_DictList) {
+        if ($CN -eq $user.CN) {
+            return $user.UserPrincipalName
+        }
+    }
+    return $null
+}
 
-    company: Layer 8 Security <layer8security.com>
-    """ + Style.RESET_ALL)
-    print(dashline + '\n')
+function Convert-FileTime {
+    param (
+        [long]$FileTime
+    )
+    $FileTime -= 116444736000000000
+    $FileTime /= 10000000
+    return [DateTime]::FromFileTime([long]$FileTime)
+}
 
-def get_user_principal_name(cn, cn_upn_dict_list):
-    user_cn = None
-    for user in cn_upn_dict_list:
-        if cn == user['CN']:
-            user_cn = user['UserPrincipalName']
+function Save-Json {
+    param (
+        [string]$Filename,
+        [object]$Data
+    )
+    $Json = $Data | ConvertTo-Json -Depth 10
+    Set-Content -Path $Filename -Value $Json
+}
+
+function Resolve-IPv4 {
+    param (
+        [array]$Computers,
+        [int]$Timeout
+    )
+    $IPDictList = @()
+    $startTime = Get-Date
+    foreach ($Host in $Computers) {
+        try {
+            $AddrInfo = [System.Net.Dns]::GetHostAddresses($Host)
+            $IPv4 = $AddrInfo | Where-Object { $_.AddressFamily -eq 'InterNetwork' }
+            if ($IPv4) {
+                $IPDictList += [PSCustomObject]@{ Name = $Host; Address = $IPv4.IPAddressToString }
+            } else {
+                $IPDictList += [PSCustomObject]@{ Name = $Host; Address = "" }
+            }
+        } catch {
+            $IPDictList += [PSCustomObject]@{ Name = $Host; Address = "" }
+        }
+        if ((Get-Date) - $startTime).TotalSeconds -gt $Timeout {
+            Write-Host "[*] Reverse DNS taking too long, skipping..."
+            foreach ($HostLeft in $Computers[$Computers.IndexOf($Host)..$Computers.Length]) {
+                $IPDictList += [PSCustomObject]@{ Name = $HostLeft; Address = "" }
+            }
             break
-    return user_cn
+        }
+    }
+    return $IPDictList
+}
 
-def get_unix_time(t):
-    t -= 116444736000000000
-    t /= 10000000
-    return t
+function Dump-LDAP {
+    param (
+        [string]$Target,
+        [string]$Domain,
+        [string]$Username,
+        [string]$Password,
+        [string]$Hashes,
+        [bool]$SSL,
+        [string]$NamingContexts
+    )
+    try {
+        $server = New-Object System.DirectoryServices.Protocols.LdapDirectoryIdentifier($Target, $SSL)
+        $credential = New-Object System.DirectoryServices.Protocols.NetworkCredential($Username, $Password)
+        $connection = New-Object System.DirectoryServices.Protocols.LdapConnection($server, $credential, [System.DirectoryServices.Protocols.AuthType]::Basic)
+        $connection.SessionOptions.SecureSocketLayer = $SSL
+        $connection.Bind()
 
-def print_table(items, header):
-    col_len = [max(len(str(row[i])) for row in items) for i in range(len(header))]
-    col_len = [max(cl, len(h)) for cl, h in zip(col_len, header)]
+        $searchRequest = New-Object System.DirectoryServices.Protocols.SearchRequest(
+            $NamingContexts,
+            "(objectClass=*)",
+            [System.DirectoryServices.Protocols.SearchScope]::Subtree,
+            $null
+        )
+        $searchResponse = $connection.SendRequest($searchRequest)
 
-    output_format = ' '.join(['{:<%d}' % width for width in col_len])
-    print(output_format.format(*header))
-    print('  '.join(['-' * length for length in col_len]))
+        $results = @()
+        foreach ($entry in $searchResponse.Entries) {
+            $result = [PSCustomObject]@{
+                Dn = $entry.DistinguishedName
+                Attributes = $entry.Attributes
+            }
+            $results += $result
+        }
+        return $results
+    } catch {
+        Write-Host "[!] Error - $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+}
 
-    for row in items:
-        print(output_format.format(*row))
+function Extract-All {
+    param (
+        [array]$Dump
+    )
+    $CN_UPN_DictList = @()
+    $Usernames = @()
+    $DomainAdmins_UPN = @()
+    $DomainAdmins_CN = @()
+    $Computers = @()
+    $DescriptionDictList = @()
+    $GroupUserDictList = @()
+    $OU_List = @()
+    $LootList = @()
+    $KerberoastableUsers = @()
 
-class Pickler:
-    def __init__(self, filename):
-        self.__filename = filename
+    foreach ($row in $Dump) {
+        if ($row.Attributes["objectClass"] -contains "person") {
+            $CN_UPN_DictList += [PSCustomObject]@{ CN = $row.Dn; UserPrincipalName = $row.Attributes["userPrincipalName"][0] }
+        }
+    }
 
-    def save_object(self, data):
-        try:
-            print(Fore.YELLOW + f"[*] Writing cached data to {self.__filename}..." + Style.RESET_ALL)
-            with open(self.__filename, "wb") as f:
-                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception as err:
-            print(Fore.RED + f"[!] Error during pickling object: {err}" + Style.RESET_ALL)
+    foreach ($row in $Dump) {
+        if ($row.Attributes["objectClass"] -contains "person" -and -not ($row.Attributes["objectClass"] -contains "computer")) {
+            if ($row.Attributes["userPrincipalName"]) {
+                $Usernames += $row.Attributes["userPrincipalName"][0]
+            } else {
+                $Usernames += $row.Attributes["sAMAccountName"][0]
+            }
+        }
 
-    def load_object(self):
-        if not exists(self.__filename):
-            return None
-        try:
-            with open(self.__filename, "rb") as f:
-                print(Fore.YELLOW + f"[*] Located LDAP cache '{self.__filename}'. Delete cache to run updated query..." + Style.RESET_ALL)
-                return pickle.load(f)
-        except Exception as err:
-            print(Fore.RED + f"[!] Error during unpickling object: {err}" + Style.RESET_ALL)
-            return None
+        if ($row.Attributes["objectClass"] -contains "group" -and $row.Attributes["cn"] -contains "Domain Admins") {
+            foreach ($member in $row.Attributes["member"]) {
+                $DomainAdmins_CN += $member
+                $user_upn = Get-UserPrincipalName -CN $member -CN_UPN_DictList $CN_UPN_DictList
+                if ($user_upn) {
+                    $DomainAdmins_UPN += $user_upn
+                } else {
+                    $DomainAdmins_UPN += $member
+                }
+            }
+        }
 
-class Hound:
-    def __init__(self, namingcontexts):
-        self.__namingcontexts = namingcontexts
-        self.__usernames = []
-        self.__domain_admins_upn = []
-        self.__domain_admins_cn = []
-        self.__computers = []
-        self.__ip_dict_list = []
-        self.__description_dict_list = []
-        self.__ou_list = []
-        self.__group_user_dict_list = []
-        self.__cn_upn_dict_list = []
-        self.__loot_list = []
-        self.__kerberostable_users = []
-        self.__key_words = ['Pass','pass','pwd','Pwd','key','userPassword', 'secret']
-        self.__default_pwd_words = ["maxPwdAge","minPwdAge","minPwdLength","pwdProperties","pwdHistoryLength","badPwdCount","badPasswordTime","pwdLastSet"]
-        self.__special_words = ['Remote','Admin','Service']
+        if ($row.Attributes["objectClass"] -contains "computer") {
+            $Computers += $row.Attributes["cn"][0]
+        }
 
-    def dump_ldap(self):
-        try:
-            s = Server(args.target, use_ssl=args.ssl, get_info='ALL')
-            password = args.password
-            if args.username == '' and args.password == '':
-                method = ANONYMOUS
-            elif '\\' not in args.username:
-                method = SIMPLE
-            else:
-                method = NTLM
-                password = args.hashes if args.hashes else args.password
+        if ($row.Attributes["objectClass"] -contains "person") {
+            $DescriptionDictList += [PSCustomObject]@{ UserPrincipalName = $row.Attributes["userPrincipalName"][0]; Description = $row.Attributes["description"][0] }
+        }
 
-            if args.hashes and method == SIMPLE:
-                print(Fore.RED + f"[!] Cannot use Pass the Hash with SIMPLE AUTH. Exiting..." + Style.RESET_ALL)
-                sys.exit()
+        if ($Groups -and $row.Attributes["objectClass"] -contains "group") {
+            $GroupUserDictList += [PSCustomObject]@{ Group = $row.Dn; Members = $row.Attributes["member"] }
+        }
 
-            server = "LDAPS" if args.ssl else "LDAP"
-            print(Fore.BLUE + f"[-] Connecting with {method} AUTH to {server} server {args.target}..." + Style.RESET_ALL)
+        if ($OrgUnit -and $row.Attributes["objectClass"] -contains "organizationalUnit") {
+            $OU_List += $row.Dn
+        }
 
-            connect = Connection(s, user=args.username, password=password, client_strategy=SAFE_SYNC, auto_bind=True, authentication=method)
+        if ($Keywords) {
+            foreach ($key in $row.Attributes) {
+                if ($key.Key -match "Pass|pass|pwd|Pwd|key|userPassword|secret") {
+                    if ($key.Key -notin @("maxPwdAge","minPwdAge","minPwdLength","pwdProperties","pwdHistoryLength","badPwdCount","badPasswordTime","pwdLastSet")) {
+                        $LootList += "($($row.Dn)) $($key.Key)=$($key.Value[0])"
+                    }
+                }
+                foreach ($item in $key.Value) {
+                    if ($item -match "Pass|pass|pwd|Pwd|key|userPassword|secret") {
+                        $LootList += $item
+                    }
+                }
+            }
+        }
+    }
 
-            search_flt = "(objectClass=*)" # specific search filters
-            results = connect.extend.standard.paged_search(search_base=self.__namingcontexts, search_filter=search_flt, search_scope=SUBTREE, attributes=ALL_ATTRIBUTES, get_operational_attributes=True)
+    $Result = [PSCustomObject]@{
+        CN_UPN_DictList = $CN_UPN_DictList
+        Usernames = $Usernames
+        DomainAdmins_UPN = $DomainAdmins_UPN
+        DomainAdmins_CN = $DomainAdmins_CN
+        Computers = $Computers
+        DescriptionDictList = $DescriptionDictList
+        GroupUserDictList = $GroupUserDictList
+        OU_List = $OU_List
+        LootList = $LootList
+        KerberoastableUsers = $KerberoastableUsers
+    }
+    return $Result
+}
 
-            total_results = []
-            for item in results:
-                total_results.append(item)
-            return total_results
+function Print-Results {
+    param (
+        [hashtable]$Results
+    )
+    function Print-List {
+        param (
+            [string]$Title,
+            [array]$Data
+        )
+        Write-Host "[+] $Title [$($Data.Count)]" -ForegroundColor Green
+        foreach ($item in $Data) {
+            Write-Host $item
+        }
+        Write-Host ""
+    }
 
-        except LDAPInvalidCredentialsResult:
-            print(Fore.RED + f"[!] Error - Invalid Credentials '{args.username}:{args.password}'" + Style.RESET_ALL)
-            sys.exit()
-        except LDAPInvalidDNSyntaxResult as err:
-            print(Fore.RED + f"[!] Error - Invalid Syntax: {err}" + Style.RESET_ALL)
-            sys.exit()
-        except LDAPSocketOpenError as err:
-            print(Fore.RED + f"[!] Error - Couldn't reach LDAP server" + Style.RESET_ALL)
-            sys.exit()
-        except Exception as err:
-            print(Fore.RED + f"[!] Error - Failure binding to LDAP server\n {(err)}" + Style.RESET_ALL)
-            sys.exit()
+    Print-List -Title "Hosts" -Data ($Results.Computers | ForEach-Object { "$($_.Name) $($_.Address)" })
+    Print-List -Title "Domain Admins" -Data $Results.DomainAdmins_UPN
+    Print-List -Title "Domain Users" -Data $Results.Usernames
+    Print-List -Title "Descriptions" -Data ($Results.DescriptionDictList | ForEach-Object { "$($_.UserPrincipalName) - $($_.Description)" })
 
-    def resolve_ipv4(self, timeout):
-        start_time = time.time()
-        with alive_bar(len(self.__computers), dual_line=True, title=Fore.YELLOW + "[*] Resolving hostnames" + Style.RESET_ALL) as bar:
-            for host in self.__computers:
-                try:
-                    addrinfo = socket.getaddrinfo(host, 80, family=socket.AF_INET)
-                    ipv4 = addrinfo[1][4][0]
-                    self.__ip_dict_list.append({"Name": host, "Address": ipv4})
-                except (socket.gaierror, IndexError, OSError):
-                    self.__ip_dict_list.append({"Name": host, "Address": ""})
-                except KeyboardInterrupt:
-                    sys.exit()
+    if ($Groups) {
+        Print-List -Title "Group Memberships" -Data ($Results.GroupUserDictList | ForEach-Object { "$($_.Group) Members: $($_.Members)" })
+    }
 
-                if (time.time() - start_time) > timeout:
-                    print(Fore.YELLOW + f"[*] Reverse DNS taking too long, skipping..." + Style.RESET_ALL)
-                    current_index = self.__computers.index(host)
-                    for host_left in self.__computers[current_index:]:
-                        self.__ip_dict_list.append({"Name": host_left, "Address": ""})
-                    break
+    if ($OrgUnit) {
+        Print-List -Title "Organizational Units" -Data $Results.OU_List
+    }
 
-                bar()
+    if ($Keywords) {
+        Print-List -Title "Key Strings" -Data $Results.LootList
+    }
 
-    def extract_all(self, dump):
-        def create_cn_upn_dict_list(dump):
-            for row in dump:
-                try:
-                    if b'person' in row['raw_attributes']['objectClass']:
-                        upn_blist = row['raw_attributes']["userPrincipalName"]
-                        upn = upn_blist[0].decode('UTF-8')
-                        cn_upn_dict = {"CN": row['dn'], "UserPrincipalName": upn}
-                        self.__cn_upn_dict_list.append(cn_upn_dict)
-                except KeyError:
-                    pass
+    if ($Kerberoast) {
+        Print-List -Title "Kerberoastable Users" -Data ($Results.KerberoastableUsers | ForEach-Object { "$($_.ServicePrincipalName) $($_.Name) $($_.MemberOf) $($_.PasswordLastSet) $($_.LastLogon)" })
+    }
+}
 
-        create_cn_upn_dict_list(dump)
+function Save-Output {
+    param (
+        [string]$OutputPrefix,
+        [hashtable]$Results
+    )
+    Save-Json -Filename "$OutputPrefix-users.json" -Data $Results.Usernames
+    Save-Json -Filename "$OutputPrefix-domain_admins.json" -Data $Results.DomainAdmins_UPN
+    Save-Json -Filename "$OutputPrefix-hosts.json" -Data $Results.Computers
+    Save-Json -Filename "$OutputPrefix-descriptions.json" -Data $Results.DescriptionDictList
+    if ($Groups) {
+        Save-Json -Filename "$OutputPrefix-groups.json" -Data $Results.GroupUserDictList
+    }
+    if ($OrgUnit) {
+        Save-Json -Filename "$OutputPrefix-org.json" -Data $Results.OU_List
+    }
+    if ($Keywords) {
+        Save-Json -Filename "$OutputPrefix-keywords.json" -Data $Results.LootList
+    }
+}
 
-        for row in dump:
-            try:
-                if b'person' in row['raw_attributes']['objectClass'] and b'computer' not in row['raw_attributes']['objectClass']:
-                    user_principal_name_blist = row['raw_attributes'].get('userPrincipalName')
-                    if user_principal_name_blist:
-                        user_principal_name = user_principal_name_blist[0].decode('UTF-8')
-                        self.__usernames.append(user_principal_name)
-                    else:
-                        user_name_blist = row['raw_attributes'].get('sAMAccountName')
-                        user_name = user_name_blist[0].decode('UTF-8')
-                        self.__usernames.append(user_name)
-            except KeyError:
-                pass
+# Main
+if ($Domain -notmatch "\.") {
+    Write-Host "[!] Domain must contain DOT (.); e.g. 'ACME.com'"
+    exit 1
+}
 
-            try:
-                if b'group' in row['raw_attributes']['objectClass'] and b'Domain Admins' in row['raw_attributes']['cn']:
-                    member_blist = row['raw_attributes']['member']
-                    self.__domain_admins_cn = [member.decode('UTF-8') for member in member_blist]
-                    for user_cn in self.__domain_admins_cn:
-                        user_upn = get_user_principal_name(user_cn, self.__cn_upn_dict_list)
-                        if user_upn:
-                            self.__domain_admins_upn.append(user_upn)
-                        else:
-                            self.__domain_admins_upn.append(user_cn)
-            except KeyError:
-                pass
+$domainParts = $Domain.Split(".")
+$NamingContexts = $domainParts | ForEach-Object { "DC=$_" } -join ","
 
-            try:
-                if b'computer' in row['raw_attributes']['objectClass']:
-                    cn_blist = row['raw_attributes']["cn"]
-                    cn = cn_blist[0].decode('UTF-8')
-                    if cn not in self.__computers:
-                        self.__computers.append(cn)
-            except KeyError:
-                pass
+Show-Banner
 
-            try:
-                if b'person' in row['raw_attributes']['objectClass']:
-                    upn_blist = row['raw_attributes']['userPrincipalName']
-                    d_blist = row['raw_attributes']['description']
-                    upn = upn_blist[0].decode('UTF-8')
-                    d = d_blist[0].decode('UTF-8')
-                    self.__description_dict_list.append({"UserPrincipalName": upn, "description": d})
-            except KeyError:
-                pass
+$ldapDump = Dump-LDAP -Target $Target -Domain $Domain -Username $Username -Password $Password -Hashes $Hashes -SSL $SSL -NamingContexts $NamingContexts
 
-            if args.groups:
-                try:
-                    if b'group' in row['raw_attributes']['objectClass']:
-                        member_blist = row['raw_attributes']['member']
-                        member_list = [i.decode('UTF-8') for i in member_blist]
-                        self.__group_user_dict_list.append({'Group': row['dn'], 'Members': member_list})
-                except KeyError:
-                    pass
+$results = Extract-All -Dump $ldapDump
+$results.Computers = Resolve-IPv4 -Computers $results.Computers -Timeout $DnsTimeout
 
-            if args.org_unit:
-                try:
-                    if b'organizationalUnit' in row['raw_attributes']['objectClass']:
-                        self.__ou_list.append(row['dn'])
-                except KeyError:
-                    pass
+Print-Results -Results $results
 
-            if args.keywords:
-                try:
-                    for key in row['raw_attributes']:
-                        object_name = row['dn']
-                        if any(word in key for word in self.__key_words):
-                            if key not in self.__default_pwd_words:
-                                self.__loot_list.append(f"({object_name}) {key}={(row['raw_attributes'].get(key))[0].decode('UTF-8')}")
-                        for item in row['raw_attributes'].get(key):
-                            try:
-                                item = item.decode('UTF-8')
-                                if any(word in item for word in self.__key_words):
-                                    self.__loot_list.append(item)
-                            except (UnicodeDecodeError, AttributeError):
-                                continue
-                except KeyError:
-                    continue
-
-    def kerberoastable(self, total_results):
-        if args.kerberoast:
-            import datetime
-            kerberoastable = []
-
-            for obj in total_results:
-                try:
-                    servicePrincipalName = obj['raw_attributes']['servicePrincipalName']
-                    if b'computer' not in obj['raw_attributes']['objectClass'] and servicePrincipalName:
-                        kerberoastable.append(obj)
-                except KeyError:
-                    continue
-
-            for obj in kerberoastable:
-                try:
-                    sAMAccountName = obj['raw_attributes'].get('sAMAccountName', [''])[0].decode('UTF-8')
-                    userAccountControl = int(obj['raw_attributes'].get('userAccountControl', ['0'])[0].decode('UTF-8'))
-                    memberOf = obj['raw_attributes'].get('memberOf', [''])[0].decode('UTF-8')
-                    pwdLastSet = get_unix_time(int(obj['raw_attributes'].get('pwdLastSet', ['0'])[0].decode('UTF-8')))
-                    pwdLastSet = 'never' if pwdLastSet == 0 else str(datetime.date.fromtimestamp(pwdLastSet))
-                    lastLogon = get_unix_time(int(obj['raw_attributes'].get('lastLogon', ['0'])[0].decode('UTF-8')))
-                    lastLogon = 'never' if lastLogon == 0 else str(datetime.date.fromtimestamp(lastLogon))
-                    SPNs = [spn.decode('UTF-8') for spn in obj['raw_attributes'].get('servicePrincipalName', [])]
-
-                    disabled_UACs = [514, 546, 66050, 66082, 262658, 262690, 328194, 328226]
-                    if userAccountControl not in disabled_UACs:
-                        for spn in SPNs:
-                            self.__kerberostable_users.append([spn, sAMAccountName, memberOf, pwdLastSet, lastLogon])
-                except (KeyError, ValueError):
-                    continue
-
-    def print(self):
-        def print_list(title, data):
-            print(Fore.GREEN + f"[+] {title} [{len(data)}]" + Style.RESET_ALL)
-            for item in data:
-                print(item)
-            print('\n')
-
-        print_list("Hosts", [f"{host['Name']} {host['Address']}" for host in self.__ip_dict_list])
-        print_list("Domain Admins", self.__domain_admins_upn)
-        print_list("Domain Users", self.__usernames)
-        print_list("Descriptions", [f"{desc['UserPrincipalName']} - {desc['description']}" for desc in self.__description_dict_list])
-
-        if args.groups:
-            print_list("Group Memberships", [f"{group['Group']} Members: {group['Members']}" for group in self.__group_user_dict_list])
-
-        if args.org_unit:
-            print_list("Organizational Units", self.__ou_list)
-
-        if args.keywords:
-            print_list("Key Strings", self.__loot_list)
-
-        if args.kerberoast:
-            print(Fore.GREEN + f"[+] Kerberoastable Users [{len(self.__kerberostable_users)}]" + Style.RESET_ALL)
-            if self.__kerberostable_users:
-                print_table(self.__kerberostable_users, header=["ServicePrincipalName", "Name", "MemberOf", "PasswordLastSet", "LastLogon"])
-                print('\n')
-
-    def save_json(self, filename, data):
-        with open(filename, 'w') as f:
-            json.dump(data, f, indent=4)
-
-    def outfiles(self):
-        if args.output:
-            output_prefix = args.output
-            self.save_json(f"{output_prefix}-users.json", self.__usernames)
-            self.save_json(f"{output_prefix}-domain_admins.json", self.__domain_admins_upn)
-            self.save_json(f"{output_prefix}-hosts.json", self.__ip_dict_list)
-            self.save_json(f"{output_prefix}-descriptions.json", self.__description_dict_list)
-            if args.groups:
-                self.save_json(f"{output_prefix}-groups.json", self.__group_user_dict_list)
-            if args.org_unit:
-                self.save_json(f"{output_prefix}-org.json", self.__ou_list)
-            if args.keywords:
-                self.save_json(f"{output_prefix}-keywords.json", self.__loot_list)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Quietly enumerate an Active Directory environment.')
-    parser.add_argument('target', metavar='TARGET', type=str, help='Domain Controller IP')
-    parser.add_argument('domain', type=str, help="Dot (.) separated Domain name including both contexts e.g. ACME.com | HOME.local | htb.net")
-    parser.add_argument('-u', '--username', default='', type=str, help="Supports SIMPLE & NTLM BIND. SIMPLE BIND use username e.g. bobdole | NTLM BIND use domain\\\\user e.g. HOME.local\\\\bobdole")
-    parser.add_argument('-p', '--password', default='', type=str, help="LDAP or Active Directory password")
-    parser.add_argument('--hashes', type=str, help="Uses NTLM BIND to authenticate with NT:LM hashes")
-    parser.add_argument('-o', '--output', type=str, help="Name for output files. Creates output files for hosts, users, domain admins, and descriptions in the current working directory.")
-    parser.add_argument('-g', '--groups', action='store_true', help="Display Group names with user members.")
-    parser.add_argument('-n', '--org-unit', action='store_true', help="Display Organizational Units.")
-    parser.add_argument('-k', '--keywords', action='store_true', help="Search for a list of key words in LDAP objects.")
-    parser.add_argument('--kerberoast', action='store_true', help="Identify kerberoastable user accounts by their SPNs.")
-    parser.add_argument('--ssl', action='store_true', help="Use a secure LDAP server on default 636 port.")
-    parser.add_argument('--dns-timeout', type=int, default=90, help="Timeout for resolving hostnames (seconds). e.g. --dns-timeout 90")
-    args = parser.parse_args()
-
-    if '.' not in args.domain:
-        print("[!] Domain must contain DOT (.); e.g. 'ACME.com'")
-        sys.exit()
-    else:
-        domain = args.domain.split('.')[0]
-        ext = args.domain.split('.')[1]
-
-        l = args.domain.split('.')
-        namingcontexts = ",".join([f"DC={word}" for word in l])
-
-    print()
-    banner()
-
-    h1 = Hound(namingcontexts)
-    p1 = Pickler(f".{domain}-{ext}.pickle")
-    cache = p1.load_object()
-
-    if not cache:
-        dump = h1.dump_ldap()
-        p1.save_object(dump)
-    else:
-        dump = cache
-
-    time.sleep(1.5)
-
-    h1.extract_all(dump)
-    h1.resolve_ipv4(args.dns_timeout)
-    h1.kerberoastable(dump)
-    h1.print()
-    h1.outfiles()
+if ($Output) {
+    Save-Output -OutputPrefix $Output -Results $results
+}
